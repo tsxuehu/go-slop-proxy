@@ -12,6 +12,7 @@ import (
 
 type Config struct {
 	DB           string          `toml:"db"`
+	AdminToken   string          `toml:"-"`
 	Bind         string          `toml:"bind"`
 	MetricsBind  string          `toml:"metrics_bind"`
 	Codex        CodexConfig     `toml:"codex"`
@@ -65,6 +66,7 @@ type ZenConfig struct {
 
 type RelayConfig struct {
 	BaseURL string `toml:"base_url"`
+	EgressConfig
 }
 
 type CopilotConfig struct {
@@ -96,6 +98,7 @@ type ModelAlias struct {
 type ModelsConfig struct {
 	Default              string                `toml:"default"`
 	DefaultEffort        string                `toml:"default_effort"`
+	Known                []string              `toml:"known"`
 	Aliases              map[string]ModelAlias `toml:"aliases"`
 	AnthropicPatterns    []string              `toml:"anthropic_patterns"`
 	GeminiPatterns       []string              `toml:"gemini_patterns"`
@@ -203,6 +206,7 @@ func DBPath() string {
 
 func Load(path string) (Config, error) {
 	cfg := Default()
+	cfg.AdminToken = os.Getenv("SLOP_ADMIN_TOKEN")
 	if path == "" {
 		path = ConfigPath()
 	}
@@ -222,8 +226,13 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(b, &cfg); err != nil {
 		return cfg, err
 	}
-	if cfg.DB == "" {
+	if db := os.Getenv("SLOP_DB"); db != "" {
+		cfg.DB = db
+	} else if cfg.DB == "" {
 		cfg.DB = DBPath()
+	}
+	if cfg.Bind == "" {
+		cfg.Bind = Default().Bind
 	}
 	if b := os.Getenv("SLOP_BIND"); b != "" {
 		cfg.Bind = b

@@ -62,6 +62,32 @@ type InputItem struct {
 	Tools []ToolDef `json:"tools,omitempty"`
 }
 
+func (item *InputItem) UnmarshalJSON(data []byte) error {
+	type plain InputItem
+	decoded := struct {
+		*plain
+		Content json.RawMessage `json:"content"`
+	}{plain: (*plain)(item)}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if len(decoded.Content) > 0 && decoded.Content[0] == '"' {
+		var text string
+		if err := json.Unmarshal(decoded.Content, &text); err != nil {
+			return err
+		}
+		item.Content = []ContentPart{{Type: "input_text", Text: text}}
+	} else if len(decoded.Content) > 0 {
+		if err := json.Unmarshal(decoded.Content, &item.Content); err != nil {
+			return err
+		}
+	}
+	if item.Type == "" && item.Role != "" {
+		item.Type = "message"
+	}
+	return nil
+}
+
 type ContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
@@ -84,6 +110,13 @@ func (t ToolOutput) TextValue() string {
 		}
 	}
 	return sb.String()
+}
+
+func (t *ToolOutput) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		return json.Unmarshal(data, &t.Text)
+	}
+	return json.Unmarshal(data, &t.Parts)
 }
 
 func (t ToolOutput) MarshalJSON() ([]byte, error) {
@@ -120,6 +153,26 @@ func FunctionTool(name string, desc *string, params json.RawMessage) ToolDef {
 type ToolChoice struct {
 	Mode string // "auto"/"none"/"required"/"" 当 mode 为空时用 Function
 	Name string
+}
+
+func (t *ToolChoice) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		return json.Unmarshal(data, &t.Mode)
+	}
+	var function struct {
+		Name     string `json:"name"`
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(data, &function); err != nil {
+		return err
+	}
+	t.Name = function.Name
+	if t.Name == "" {
+		t.Name = function.Function.Name
+	}
+	return nil
 }
 
 func (t ToolChoice) MarshalJSON() ([]byte, error) {

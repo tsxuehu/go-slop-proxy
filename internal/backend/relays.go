@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -49,44 +48,66 @@ func doGet(ctx context.Context, url string, headers map[string]string) (*http.Re
 	return resp, nil
 }
 
-// ---------- OpenRouter ----------
-
-type OpenRouterClient struct{ base string }
-
-func NewOpenRouter(cfg config.RelayConfig) *OpenRouterClient {
-	return &OpenRouterClient{base: strings.TrimRight(cfg.BaseURL, "/")}
+type relayTransport struct {
+	pool *upstream.EgressPool
+	err  error
 }
 
-func (c *OpenRouterClient) Post(ctx context.Context, key, path string, body []byte) (*http.Response, *upstream.SendError) {
-	return doPost(ctx, c.base+path, map[string]string{"Authorization": "Bearer " + key}, body)
+func newRelayTransport(cfg config.RelayConfig, name string) relayTransport {
+	pool, err := upstream.NewEgressPool(cfg.EgressConfig, name, "")
+	return relayTransport{pool: pool, err: err}
 }
 
-// ---------- Experiential ----------
-
-type ExperientialClient struct{ base string }
-
-func NewExperiential(cfg config.RelayConfig) *ExperientialClient {
-	return &ExperientialClient{base: strings.TrimRight(cfg.BaseURL, "/")}
+func (t relayTransport) ReloadEgress() error {
+	if t.err != nil {
+		return t.err
+	}
+	return t.pool.Reload()
 }
 
-func (c *ExperientialClient) Post(ctx context.Context, key, path string, body []byte) (*http.Response, *upstream.SendError) {
-	return doPost(ctx, c.base+path, map[string]string{"Authorization": "Bearer " + key}, body)
+func (t relayTransport) request(ctx context.Context, method, url string, headers map[string]string, body []byte) (*http.Response, *upstream.SendError) {
+	if t.err != nil {
+		return nil, upstream.NetworkError(t.err)
+	}
+	return t.pool.Send(ctx, func(_ *http.Client) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		for name, value := range headers {
+			req.Header.Set(name, value)
+		}
+		if method == http.MethodPost {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req, nil
+	})
 }
 
-// ---------- Radiance ----------
-
-type RadianceClient struct{ base string }
-
-func NewRadiance(cfg config.RelayConfig) *RadianceClient {
-	return &RadianceClient{base: strings.TrimRight(cfg.BaseURL, "/")}
+func (t relayTransport) post(ctx context.Context, url string, headers map[string]string, body []byte, rules upstream.Classify) (*http.Response, *upstream.SendError) {
+	resp, err := t.request(ctx, http.MethodPost, url, headers, body)
+	if err != nil {
+		return nil, err
+	}
+	return upstream.ClassifyResponse(resp, rules)
 }
 
-func (c *RadianceClient) Post(ctx context.Context, key, path string, body []byte) (*http.Response, *upstream.SendError) {
-	return doPost(ctx, c.base+path, map[string]string{"Authorization": "Bearer " + key}, body)
+// OpenRouter, Experiential and Radiance share a bearer-auth Messages surface.
+type MessagesRelay struct {
+	relayTransport
+	base string
 }
 
-func (c *RadianceClient) Models(ctx context.Context, key string) ([]string, *upstream.SendError) {
-	resp, se := doGet(ctx, c.base+"/v1/models", map[string]string{"Authorization": "Bearer " + key})
+func NewMessagesRelay(cfg config.RelayConfig, name string) *MessagesRelay {
+	return &MessagesRelay{relayTransport: newRelayTransport(cfg, name), base: strings.TrimRight(cfg.BaseURL, "/")}
+}
+
+func (c *MessagesRelay) Post(ctx context.Context, key, path string, body []byte) (*http.Response, *upstream.SendError) {
+	return c.post(ctx, c.base+path, map[string]string{"Authorization": "Bearer " + key}, body, upstream.Strict)
+}
+
+func (c *MessagesRelay) Models(ctx context.Context, key string) ([]string, *upstream.SendError) {
+	resp, se := c.request(ctx, http.MethodGet, c.base+"/v1/models", map[string]string{"Authorization": "Bearer " + key}, nil)
 	if se != nil {
 		return nil, se
 	}
@@ -113,20 +134,23 @@ func parseIDList(resp *http.Response) ([]string, *upstream.SendError) {
 
 // ---------- DeepSeek ----------
 
-type DeepSeekClient struct{ root string }
+type DeepSeekClient struct {
+	relayTransport
+	root string
+}
 
 func NewDeepSeek(cfg config.RelayConfig) *DeepSeekClient {
-	return &DeepSeekClient{root: strings.TrimRight(cfg.BaseURL, "/")}
+	return &DeepSeekClient{relayTransport: newRelayTransport(cfg, "deepseek"), root: strings.TrimRight(cfg.BaseURL, "/")}
 }
 
 func (c *DeepSeekClient) Post(ctx context.Context, key, path string, body []byte) (*http.Response, *upstream.SendError) {
-	return doPost(ctx, c.root+"/anthropic"+path, map[string]string{
+	return c.post(ctx, c.root+"/anthropic"+path, map[string]string{
 		"x-api-key": key, "anthropic-version": "2023-06-01",
-	}, body)
+	}, body, upstream.Strict)
 }
 
 func (c *DeepSeekClient) Models(ctx context.Context, key string) ([]string, *upstream.SendError) {
-	resp, se := doGet(ctx, c.root+"/models", map[string]string{"Authorization": "Bearer " + key})
+	resp, se := c.request(ctx, http.MethodGet, c.root+"/models", map[string]string{"Authorization": "Bearer " + key}, nil)
 	if se != nil {
 		return nil, se
 	}
@@ -141,12 +165,13 @@ var glmRules = upstream.Classify{
 }
 
 type GLMClient struct {
+	relayTransport
 	base     string
 	quotaURL string
 }
 
 func NewGLM(cfg config.RelayConfig) *GLMClient {
-	return &GLMClient{base: strings.TrimRight(cfg.BaseURL, "/"), quotaURL: "https://api.z.ai/api/monitor/usage/quota/limit"}
+	return &GLMClient{relayTransport: newRelayTransport(cfg, "glm"), base: strings.TrimRight(cfg.BaseURL, "/"), quotaURL: "https://api.z.ai/api/monitor/usage/quota/limit"}
 }
 
 func glmHeaders(key string) map[string]string {
@@ -166,16 +191,11 @@ func (c *GLMClient) Post(ctx context.Context, key, path string, body []byte, ses
 	h["x-request-id"] = newUUID()
 	h["x-zcode-trace-id"] = newUUID()
 	h["x-session-id"] = session
-	resp, se := doPost(ctx, c.base+path, h, body)
-	if se != nil {
-		return resp, se
-	}
-	checked, se := upstream.ClassifyResponse(resp, glmRules)
-	return checked, se
+	return c.post(ctx, c.base+path, h, body, glmRules)
 }
 
 func (c *GLMClient) Models(ctx context.Context, key string) ([]string, *upstream.SendError) {
-	resp, se := doGet(ctx, c.base+"/v1/models", glmHeaders(key))
+	resp, se := c.request(ctx, http.MethodGet, c.base+"/v1/models", glmHeaders(key), nil)
 	if se != nil {
 		return nil, se
 	}
@@ -247,7 +267,7 @@ func (q *quotaEnvelope) Usage(largestWeekly float64) *pool.AccountUsage {
 }
 
 func (c *GLMClient) Quota(ctx context.Context, key string) (*quotaEnvelope, *upstream.SendError) {
-	resp, se := doGet(ctx, c.quotaURL, map[string]string{"authorization": key})
+	resp, se := c.request(ctx, http.MethodGet, c.quotaURL, map[string]string{"authorization": key}, nil)
 	if se != nil {
 		return nil, se
 	}
@@ -257,5 +277,3 @@ func (c *GLMClient) Quota(ctx context.Context, key string) (*quotaEnvelope, *ups
 	}
 	return &q, nil
 }
-
-var _ = io.Discard

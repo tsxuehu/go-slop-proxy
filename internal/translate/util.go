@@ -49,7 +49,7 @@ func ParseSSE(r io.Reader, handle func(eventType, data string) error) error {
 		if strings.HasPrefix(line, "event:") {
 			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		} else if strings.HasPrefix(line, "data:") {
-			data += strings.TrimPrefix(line, "data:") + "\n"
+			data += strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ") + "\n"
 		}
 	}
 	if err := flush(); err != nil {

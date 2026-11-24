@@ -96,10 +96,6 @@ func (s *Server) websocketResponses(w http.ResponseWriter, r *http.Request, rc *
 			"this token is not scoped to the "+target.String()+" backend")
 		return
 	}
-	if rc.tokensSpent != nil {
-		writeAPIError(w, dialectOpenAI, http.StatusTooManyRequests, "rate_limit_error", "API token token limit exceeded")
-		return
-	}
 	if !wsUpgradeRequested(r) {
 		wsUpgradeRequired(w)
 		return
@@ -478,6 +474,17 @@ func (r *wsRelay) handleClientFrame(ctx context.Context, ev wsEvent) bool {
 	if admitErr != nil {
 		wsWrite(r.client, websocket.TextMessage,
 			wsErrorFrame(status, kind, admitErr.Error(), headers, prepared.StreamID))
+		return true
+	}
+	if !auth.token.MayUse(provider.OpenAI) {
+		wsWrite(r.client, websocket.TextMessage,
+			wsErrorFrame(403, "permission_error", "this token is not scoped to the openai backend", nil, prepared.StreamID))
+		return true
+	}
+	if auth.tokensSpent != nil && auth.token.Meters(provider.OpenAI) {
+		headers := map[string]string{"retry-after": strconv.FormatInt(*auth.tokensSpent, 10)}
+		wsWrite(r.client, websocket.TextMessage,
+			wsErrorFrame(429, "rate_limit_error", "API token token limit exceeded for the openai backend", headers, prepared.StreamID))
 		return true
 	}
 	if auth.token.PinnedAccount != nil && (r.accountID == nil || *auth.token.PinnedAccount != *r.accountID) {

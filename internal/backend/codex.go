@@ -201,7 +201,7 @@ func (b *CodexBackend) Send(ctx context.Context, token string, slot *pool.Slot, 
 
 func sensitive(k string) bool {
 	switch strings.ToLower(k) {
-	case "authorization", "chatgpt-account-id", "originator", "version", "host", "content-length", "connection", "accept-encoding":
+	case "authorization", "x-api-key", "x-goog-api-key", "chatgpt-account-id", "originator", "version", "host", "content-length", "connection", "accept-encoding":
 		return true
 	default:
 		return false
@@ -260,7 +260,20 @@ func (b *CodexBackend) Usage(ctx context.Context, token, accountID string) (*poo
 
 // CatalogSnapshot is the result of a /models probe: the servable model ids
 // plus, for each model, the service tiers the account advertises.
+type CodexModel struct {
+	Slug            string   `json:"slug"`
+	ContextWindow   *int64   `json:"context_window"`
+	InputModalities []string `json:"input_modalities"`
+	Visibility      *string  `json:"visibility"`
+	SupportedInAPI  *bool    `json:"supported_in_api"`
+	ServiceTiers    []struct {
+		ID string `json:"id"`
+	} `json:"service_tiers"`
+}
+
 type CatalogSnapshot struct {
+	Raw          map[string]json.RawMessage
+	Entries      []CodexModel
 	Models       []string
 	ServiceTiers map[string][]string
 }
@@ -291,27 +304,22 @@ func (b *CodexBackend) Catalog(ctx context.Context, token, accountID string) (*C
 		return nil, se
 	}
 	defer ok.Body.Close()
-	var doc struct {
-		Models []struct {
-			Slug           string  `json:"slug"`
-			Visibility     *string `json:"visibility"`
-			SupportedInAPI *bool   `json:"supported_in_api"`
-			ServiceTiers   []struct {
-				ID string `json:"id"`
-			} `json:"service_tiers"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(ok.Body).Decode(&doc); err != nil {
+	snap := &CatalogSnapshot{ServiceTiers: make(map[string][]string)}
+	if err := json.NewDecoder(ok.Body).Decode(&snap.Raw); err != nil {
 		return nil, &upstream.SendError{Kind: upstream.ErrUpstream, Body: err.Error()}
 	}
-	snap := &CatalogSnapshot{Models: make([]string, 0, len(doc.Models)), ServiceTiers: make(map[string][]string)}
-	for _, m := range doc.Models {
+	var models []CodexModel
+	if err := json.Unmarshal(snap.Raw["models"], &models); err != nil {
+		return nil, &upstream.SendError{Kind: upstream.ErrUpstream, Body: err.Error()}
+	}
+	for _, m := range models {
 		if m.Visibility != nil && *m.Visibility == "hidden" {
 			continue
 		}
 		if m.SupportedInAPI != nil && !*m.SupportedInAPI {
 			continue
 		}
+		snap.Entries = append(snap.Entries, m)
 		snap.Models = append(snap.Models, m.Slug)
 		if len(m.ServiceTiers) > 0 {
 			tiers := make([]string, 0, len(m.ServiceTiers))

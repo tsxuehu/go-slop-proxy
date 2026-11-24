@@ -2,7 +2,6 @@ package backend
 
 import (
 	"context"
-	"net/http"
 	"time"
 
 	"github.com/edy/slop-proxy-go/internal/pool"
@@ -73,17 +72,15 @@ func (b *GeminiBackend) RateLimitBase() int64            { return 40 }
 func (b *GeminiBackend) RefreshOnce() bool               { return false }
 func (b *GeminiBackend) StickyWaitSecs() int64           { return 40 }
 func (b *GeminiBackend) SessionAffinity() bool           { return false }
-func (b *GeminiBackend) RetryBudget() time.Duration      { return 90 * time.Second }
+func (b *GeminiBackend) RetryBudget() time.Duration      { return b.client.retryBudget }
 func (b *GeminiBackend) RetryableBadRequest(string) bool { return false }
 func (b *GeminiBackend) Reason(s string) string          { return translate.ChatReason(s) }
 func (b *GeminiBackend) UsageFrom(resp any) *pool.AccountUsage {
-	if r, ok := resp.(*http.Response); ok && r != nil {
-		return usageFromHeaders(httpHeaderMap(r.Header))
+	if r, ok := resp.(*GeminiResponse); ok && r != nil {
+		return usageFromHeaders(r.Response.Header)
 	}
 	return nil
 }
-
-func httpHeaderMap(h http.Header) map[string][]string { return map[string][]string(h) }
 
 func (b *GeminiBackend) Send(ctx context.Context, token string, slot *pool.Slot, route pool.Route, req any) (any, error) {
 	var referer *string
@@ -96,22 +93,14 @@ func (b *GeminiBackend) Send(ctx context.Context, token string, slot *pool.Slot,
 		if se != nil {
 			return nil, mapSendError(se)
 		}
-		return result.Response, nil
+		return result, nil
 	case *translate.ChatRequest:
 		result, se := b.client.Post(ctx, token, referer, r)
 		if se != nil {
 			return nil, mapSendError(se)
 		}
-		return result.Response, nil
+		return result, nil
 	default:
 		return nil, &pool.SendError{Kind: pool.SendNetwork, Body: "unexpected gemini request type"}
 	}
 }
-
-// Gemini streaming responses need protocol-aware bridging; the raw response
-// is returned here and handled by the server's Gemini path.
-func (b *GeminiBackend) PostWithProtocol(ctx context.Context, token string, referer *string, chat *translate.ChatRequest) (*GeminiResponse, *upstream.SendError) {
-	return b.client.Post(ctx, token, referer, chat)
-}
-
-var _ = context.Background

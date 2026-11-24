@@ -138,10 +138,12 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(4)
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -240,7 +242,6 @@ CREATE TABLE IF NOT EXISTS usage_log (
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_user_ts ON usage_log(user, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_account_ts ON usage_log(account_id, ts);
-CREATE INDEX IF NOT EXISTS idx_usage_session_ts ON usage_log(session_key, ts);
 
 CREATE TABLE IF NOT EXISTS account_usage (
   account_id INTEGER NOT NULL,
@@ -251,23 +252,21 @@ CREATE TABLE IF NOT EXISTS account_usage (
   PRIMARY KEY (account_id, window)
 );
 `
-	for _, stmt := range strings.Split(schema, ";") {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" {
-			continue
-		}
-		if _, err := s.db.Exec(stmt); err != nil {
-			return fmt.Errorf("migrate %q: %w", stmt[:min(len(stmt), 60)], err)
-		}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	return nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
+	defer tx.Rollback()
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("create proxy schema: %w", err)
 	}
-	return b
+	if err := migrateLegacyColumns(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_usage_session_ts ON usage_log(session_key, ts)"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // hashKey stores the same 32-byte digest as the Rust original, so a database
@@ -290,9 +289,10 @@ func GenerateToken() (string, string) {
 }
 
 const accountCols = `id, provider, provider_account_id, trusted, reserved, egress,
-	auth_mode, email, label, plan_type, access_token, refresh_token, http_referer,
-	turn_state, access_expires_at, last_refresh_at, status, cooldown_until,
-	disabled_reason, allowed_users, created_at, updated_at`
+	auth_mode, COALESCE(email, ''), COALESCE(label, ''), COALESCE(plan_type, ''),
+	access_token, refresh_token, COALESCE(http_referer, ''), COALESCE(turn_state, ''),
+	COALESCE(access_expires_at, 0), COALESCE(last_refresh_at, 0), status, COALESCE(cooldown_until, 0),
+	COALESCE(disabled_reason, ''), allowed_users, created_at, updated_at`
 
 func scanAccount(row interface{ Scan(...any) error }) (Account, error) {
 	var a Account
@@ -334,7 +334,8 @@ func (s *Store) ListAccounts(ctx context.Context, provider string) ([]Account, e
 
 func (s *Store) FindAccount(ctx context.Context, key string) (Account, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+accountCols+` FROM accounts
-		WHERE CAST(id AS TEXT) = ? OR email = ? OR provider_account_id = ? LIMIT 1`, key, key, key)
+		WHERE CAST(id AS TEXT) = ? OR email = ? OR label = ? OR provider_account_id = ?
+		ORDER BY CASE WHEN CAST(id AS TEXT) = ? THEN 0 ELSE 1 END, id LIMIT 1`, key, key, key, key, key)
 	a, err := scanAccount(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
@@ -535,9 +536,9 @@ func boolInt(v bool) int {
 	return 0
 }
 
-const tokenCols = `id, user, token_hash, token_prefix, request_limit, token_limit,
+const tokenCols = `id, user, token_hash, token_prefix, COALESCE(request_limit, 0), COALESCE(token_limit, 0),
 	window_seconds, slowdown_ms, prefer_trusted, reserved_only, pinned_account,
-	allowed_providers, metered_providers, created_at, revoked_at`
+	allowed_providers, metered_providers, created_at, COALESCE(revoked_at, 0)`
 
 func scanToken(row interface{ Scan(...any) error }) (Token, error) {
 	var t Token
@@ -556,7 +557,7 @@ func scanToken(row interface{ Scan(...any) error }) (Token, error) {
 }
 
 func (s *Store) AuthToken(ctx context.Context, key string) (Token, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+tokenCols+` FROM api_tokens WHERE token_hash=? AND revoked_at=0`, hashKey(key))
+	row := s.db.QueryRowContext(ctx, `SELECT `+tokenCols+` FROM api_tokens WHERE token_hash=? AND COALESCE(revoked_at, 0)=0`, hashKey(key))
 	t, err := scanToken(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return t, ErrNotFound

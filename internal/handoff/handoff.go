@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -75,6 +76,9 @@ type NamedListener struct {
 // ControlPath returns $RUNTIME_DIRECTORY/control, or "" when unset. Without a
 // runtime directory there is nothing to hand off from and Accept is a no-op.
 func ControlPath() string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
 	dir := os.Getenv("RUNTIME_DIRECTORY")
 	if dir == "" {
 		return ""
@@ -92,6 +96,9 @@ type Inherited struct {
 // LISTEN_PID removed, so its inherited fds are ours unconditionally.
 func Take() *Inherited {
 	out := &Inherited{Listeners: make(map[Socket]net.Listener)}
+	if runtime.GOOS == "windows" {
+		return out
+	}
 	if pid := os.Getenv("LISTEN_PID"); pid != "" && pid != strconv.Itoa(os.Getpid()) {
 		return out
 	}
@@ -134,14 +141,6 @@ func Take() *Inherited {
 	return out
 }
 
-func isSocket(fd uintptr) bool {
-	var st syscall.Stat_t
-	if err := syscall.Fstat(int(fd), &st); err != nil {
-		return false
-	}
-	return st.Mode&syscall.S_IFMT == syscall.S_IFSOCK
-}
-
 // Listen adopts an inherited listener for socket, or binds addr when absent.
 func (i *Inherited) Listen(socket Socket, addr string) (net.Listener, error) {
 	if ln, ok := i.Listeners[socket]; ok {
@@ -165,6 +164,9 @@ func (i *Inherited) CloseRemaining() {
 // lines let systemd retarget MAINPID, which is what makes it SIGTERM the
 // predecessor. Failure is only a warning, matching the Rust original.
 func NotifyReady() {
+	if runtime.GOOS == "windows" {
+		return
+	}
 	sock := os.Getenv("NOTIFY_SOCKET")
 	if sock == "" {
 		return
@@ -187,6 +189,9 @@ func NotifyReady() {
 // RelievePredecessor sends SIGTERM to the pid recorded by our predecessor.
 // This is the belt-and-braces companion to systemd's own SIGTERM.
 func RelievePredecessor() {
+	if runtime.GOOS == "windows" {
+		return
+	}
 	pid, err := strconv.Atoi(os.Getenv(PredecessorEnv))
 	if err != nil || pid <= 0 {
 		return
@@ -204,6 +209,9 @@ func RelievePredecessor() {
 // inherited sockets. The request is NUL-joined argv; the reply is exactly
 // "ok" on success or a human-readable error string.
 func Request(argv []string) error {
+	if runtime.GOOS == "windows" {
+		return errors.New("socket handoff is not supported on Windows")
+	}
 	path := ControlPath()
 	if path == "" {
 		return errors.New("RUNTIME_DIRECTORY is unset, nothing to hand off from")

@@ -38,9 +38,14 @@ type globalArgs struct {
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
+	verbose := flag.Bool("verbose", false, "enable debug logging")
+	flag.BoolVar(verbose, "v", false, "enable debug logging")
 	cfgPath := flag.String("config", "", "path to config.toml")
 	dbPath := flag.String("db", "", "path to the sqlite database")
 	flag.Parse()
+	if *verbose {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 	args := flag.Args()
 	if len(args) == 0 {
 		usage()
@@ -364,7 +369,7 @@ func accounts(ctx context.Context, st *store.Store, args []string) {
 
 // bindLimits wires the original proxy's full LimitArgs flag set, shared by
 // token create and token limits.
-func bindLimits(fs *flag.FlagSet) func() store.TokenLimits {
+func bindLimits(fs *flag.FlagSet, ctx context.Context, st *store.Store) func() (store.TokenLimits, error) {
 	requests := fs.Int64("requests", 0, "request limit")
 	tokens := fs.Int64("tokens", 0, "token limit")
 	window := fs.Int64("window-seconds", 3600, "rolling window")
@@ -373,25 +378,46 @@ func bindLimits(fs *flag.FlagSet) func() store.TokenLimits {
 	reserved := fs.Bool("reserved-only", false, "reserved accounts only")
 	providers := fs.String("providers", "", "comma-separated allowed providers")
 	metered := fs.String("metered", "", "comma-separated metered providers")
-	pinned := fs.String("pin-account", "", "account id to pin")
-	return func() store.TokenLimits {
+	pinned := fs.String("pin-account", "", "account ID, email or label to pin")
+	return func() (store.TokenLimits, error) {
+		if *requests < 0 || *tokens < 0 || *window < 1 || *slow < 0 {
+			return store.TokenLimits{}, fmt.Errorf("invalid request, token, window or delay limit")
+		}
 		limits := store.TokenLimits{
 			Requests: *requests, Tokens: *tokens, WindowSecs: *window,
 			SlowdownMS: *slow, PreferTrusted: *prefer, ReservedOnly: *reserved,
 		}
-		if *providers != "" {
-			limits.Providers = strings.Split(*providers, ",")
+		var err error
+		if limits.Providers, err = parseProviderList(*providers); err != nil {
+			return store.TokenLimits{}, err
 		}
-		if *metered != "" {
-			limits.Metered = strings.Split(*metered, ",")
+		if limits.Metered, err = parseProviderList(*metered); err != nil {
+			return store.TokenLimits{}, err
 		}
 		if *pinned != "" {
-			if id, err := strconv.ParseInt(*pinned, 10, 64); err == nil {
-				limits.PinnedAccount = &id
+			account, err := st.FindAccount(ctx, *pinned)
+			if err != nil {
+				return store.TokenLimits{}, fmt.Errorf("pin account %q: %w", *pinned, err)
 			}
+			limits.PinnedAccount = &account.ID
 		}
-		return limits
+		return limits, nil
 	}
+}
+
+func parseProviderList(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var providers []string
+	for _, name := range strings.Split(raw, ",") {
+		if p, ok := provider.Parse(strings.TrimSpace(name)); ok {
+			providers = append(providers, p.String())
+		} else {
+			return nil, fmt.Errorf("unknown provider %q", name)
+		}
+	}
+	return providers, nil
 }
 
 func token(ctx context.Context, st *store.Store, args []string) {
@@ -402,13 +428,17 @@ func token(ctx context.Context, st *store.Store, args []string) {
 	case "create":
 		fs := flag.NewFlagSet("create", flag.ExitOnError)
 		user := fs.String("user", "", "user")
-		limitsOf := bindLimits(fs)
+		limitsOf := bindLimits(fs, ctx, st)
 		_ = fs.Parse(args[1:])
 		if *user == "" {
 			fatal(fmt.Errorf("--user required"))
 		}
 		key, _ := store.GenerateToken()
-		t, err := st.CreateToken(ctx, key, *user, limitsOf())
+		limits, err := limitsOf()
+		if err != nil {
+			fatal(err)
+		}
+		t, err := st.CreateToken(ctx, key, *user, limits)
 		if err != nil {
 			fatal(err)
 		}
@@ -431,13 +461,20 @@ func token(ctx context.Context, st *store.Store, args []string) {
 		fmt.Println("revoked")
 	case "limits":
 		fs := flag.NewFlagSet("limits", flag.ExitOnError)
-		limitsOf := bindLimits(fs)
-		_ = fs.Parse(args[2:])
-		tok, err := st.FindToken(ctx, args[1])
+		limitsOf := bindLimits(fs, ctx, st)
+		_ = fs.Parse(reorderFlags(args[1:], map[string]bool{"prefer-trusted": true, "reserved-only": true}))
+		if fs.NArg() != 1 {
+			fatal(fmt.Errorf("token ID or prefix required"))
+		}
+		tok, err := st.FindToken(ctx, fs.Arg(0))
 		if err != nil {
 			fatal(err)
 		}
-		if err := st.SetTokenLimits(ctx, tok.ID, limitsOf()); err != nil {
+		limits, err := limitsOf()
+		if err != nil {
+			fatal(err)
+		}
+		if err := st.SetTokenLimits(ctx, tok.ID, limits); err != nil {
 			fatal(err)
 		}
 		fmt.Println("ok")
@@ -449,7 +486,7 @@ func token(ctx context.Context, st *store.Store, args []string) {
 		if err != nil {
 			fatal(err)
 		}
-		reqs, input, output, err := st.TokenUsage(ctx, tok.ID, 3600)
+		reqs, input, output, err := st.TokenUsage(ctx, tok.ID, tok.WindowSecs)
 		if err != nil {
 			fatal(err)
 		}

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -42,21 +43,33 @@ type ZenClient struct {
 
 func NewZen(cfg config.ZenConfig) (*ZenClient, error) {
 	z := &ZenClient{modelsDevURL: cfg.ModelsDevURL, contextWindows: map[string]int64{}}
+	exits := upstream.NewExits(cfg.EgressConfig)
 	for _, raw := range cfg.BaseURLs {
-		pool, err := upstream.NewEgressPool(cfg.EgressConfig, "zen", cfg.UserAgent)
+		pool, err := upstream.NewSharedEgressPool(cfg.EgressConfig, "zen", cfg.UserAgent, exits)
 		if err != nil {
 			return nil, err
 		}
 		z.hosts = append(z.hosts, &zenHost{BaseURL: strings.TrimRight(raw, "/"), Pool: pool})
 	}
 	if cfg.GoBaseURL != "" {
-		pool, err := upstream.NewEgressPool(cfg.EgressConfig, "zen", cfg.UserAgent)
+		pool, err := upstream.NewSharedEgressPool(cfg.EgressConfig, "zen", cfg.UserAgent, exits)
 		if err != nil {
 			return nil, err
 		}
 		z.goHost = &zenHost{BaseURL: strings.TrimRight(cfg.GoBaseURL, "/"), Pool: pool}
 	}
 	return z, nil
+}
+
+func (c *ZenClient) ReloadEgress() error {
+	var reloadErr error
+	for _, host := range c.hosts {
+		reloadErr = errors.Join(reloadErr, host.Pool.Reload())
+	}
+	if c.goHost != nil {
+		reloadErr = errors.Join(reloadErr, c.goHost.Pool.Reload())
+	}
+	return reloadErr
 }
 
 // ZenSession derives the stable free-tier session id from the caller's
@@ -137,6 +150,9 @@ func (c *ZenClient) Post(ctx context.Context, key *string, session, path string,
 			resp, outcome = host.Pool.SendAnonymous(ctx, build)
 		} else {
 			resp, outcome = host.Pool.Send(ctx, build)
+			if outcome == nil {
+				resp, outcome = upstream.ClassifyResponse(resp, upstream.Strict)
+			}
 		}
 		if outcome == nil {
 			return resp, nil
@@ -146,15 +162,16 @@ func (c *ZenClient) Post(ctx context.Context, key *string, session, path string,
 				// Replay with the same egress a few times before giving up.
 				for tries := 1; tries < replayTries; tries++ {
 					time.Sleep(250 * time.Millisecond)
-					req, err := build(sharedClient)
-					if err != nil {
-						break
+					var checked *http.Response
+					var se *upstream.SendError
+					if anonymous {
+						checked, se = host.Pool.SendAnonymous(ctx, build)
+					} else {
+						checked, se = host.Pool.Send(ctx, build)
+						if se == nil {
+							checked, se = upstream.ClassifyResponse(checked, upstream.Strict)
+						}
 					}
-					r, err := sharedClient.Do(req)
-					if err != nil {
-						break
-					}
-					checked, se := upstream.ClassifyResponse(r, upstream.Strict)
 					if se == nil {
 						return checked, nil
 					}

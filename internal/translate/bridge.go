@@ -3,7 +3,6 @@ package translate
 import (
 	"encoding/json"
 	"sort"
-	"time"
 )
 
 type BridgeProtocol int
@@ -247,7 +246,11 @@ func (b *ChatToResponses) toolCall(call *ChatToolCall) []*ResponsesEvent {
 		b.Calls[idx] = slot
 	}
 	if slot.ID == "" {
-		slot.ID = "call_" + randomHex(16)
+		if call.ID != nil && *call.ID != "" {
+			slot.ID = *call.ID
+		} else {
+			slot.ID = "call_" + randomHex(16)
+		}
 	}
 	if call.Function.Name != nil {
 		slot.Name = *call.Function.Name
@@ -267,8 +270,11 @@ func (b *ChatToResponses) toolCall(call *ChatToolCall) []*ResponsesEvent {
 		})
 	}
 	args := ""
-	if wasAnnounced && call.Function.Arguments != nil {
+	if call.Function.Arguments != nil {
 		args = *call.Function.Arguments
+		if !wasAnnounced {
+			args = slot.Arguments
+		}
 	}
 	if slot.Announced && args != "" {
 		out = append(out, &ResponsesEvent{
@@ -316,5 +322,3 @@ func (b *ChatToResponses) Finalize() []*ResponsesEvent {
 	b.Completed = true
 	return []*ResponsesEvent{b.terminal()}
 }
-
-var _ = time.Now

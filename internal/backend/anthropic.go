@@ -35,6 +35,8 @@ func NewAnthropic(cfg config.AnthropicConfig) (*AnthropicClient, error) {
 	return &AnthropicClient{base: strings.TrimRight(cfg.BaseURL, "/"), pool: pool, client: sharedClient}, nil
 }
 
+func (c *AnthropicClient) ReloadEgress() error { return c.pool.Reload() }
+
 type RelayHeaders struct {
 	Version   string
 	Beta      string
@@ -90,7 +92,11 @@ func (c *AnthropicClient) Post(ctx context.Context, credential, authMode string,
 	}
 
 	if viaEgress {
-		return c.pool.Send(ctx, build)
+		resp, sendErr := c.pool.Send(ctx, build)
+		if sendErr != nil {
+			return nil, sendErr
+		}
+		return upstream.ClassifyResponse(resp, anthropicRules)
 	}
 	req, err := build(sharedClient)
 	if err != nil {
@@ -179,28 +185,36 @@ func (r *AnthUsageReport) Locked() bool {
 		(r.SevenDay != nil && r.SevenDay.LockedReason != nil)
 }
 
-func (c *AnthropicClient) Models(ctx context.Context, accessToken string) ([]string, *upstream.SendError) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/models?limit=100", nil)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", oauthBeta)
+type AnthropicModel struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   string `json:"created_at"`
+	Type        string `json:"type"`
+}
+
+func (c *AnthropicClient) Models(ctx context.Context, credential, authMode string) ([]AnthropicModel, *upstream.SendError) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/models?limit=100", nil)
+	if err != nil {
+		return nil, upstream.NetworkError(err)
+	}
+	if authMode == "oauth" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+		req.Header.Set("anthropic-beta", oauthBeta)
+	} else {
+		req.Header.Set("x-api-key", credential)
+	}
 	req.Header.Set("anthropic-version", "2023-06-01")
 	resp, err := sharedClient.Do(req)
 	if err != nil {
 		return nil, upstream.NetworkError(err)
 	}
 	catalog, se := upstream.JSON[struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []AnthropicModel `json:"data"`
 	}](resp, upstream.Strict, "/v1/models")
 	if se != nil {
 		return nil, se
 	}
-	ids := make([]string, 0, len(catalog.Data))
-	for _, m := range catalog.Data {
-		ids = append(ids, m.ID)
-	}
-	return ids, nil
+	return catalog.Data, nil
 }
 
 var _ = time.Now

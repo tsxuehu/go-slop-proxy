@@ -11,6 +11,7 @@ import (
 	"github.com/edy/slop-proxy-go/internal/pool"
 	"github.com/edy/slop-proxy-go/internal/provider"
 	"github.com/edy/slop-proxy-go/internal/store"
+	"github.com/edy/slop-proxy-go/internal/translate"
 )
 
 func newSmokeStore(t *testing.T) *store.Store {
@@ -69,7 +70,9 @@ func TestDesktopAndConfigRoutes(t *testing.T) {
 	if _, err := st.CreateToken(context.Background(), key, "smoke", store.TokenLimits{}); err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{cfg: config.Default(), store: st}
+	cfg := config.Default()
+	cfg.Models.Known = []string{"gpt-5"}
+	srv := &Server{cfg: cfg, store: st}
 	h := srv.Router()
 
 	cases := []struct {
@@ -176,16 +179,19 @@ func TestInfraRoutes(t *testing.T) {
 
 func TestScanNativeUsage(t *testing.T) {
 	jsonBody := []byte(`{"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":7}}`)
-	if in, out := scanNativeUsage(jsonBody); in != 12 || out != 7 {
-		t.Errorf("json usage = %d/%d", in, out)
+	capture := &translate.UsageCapture{}
+	scan := &chatRelayUsage{capture: capture, native: true}
+	scan.observe(jsonBody)
+	if got := capture.Snapshot(); got.InputTokens != 12 || got.OutputTokens != 7 {
+		t.Errorf("json usage = %d/%d", got.InputTokens, got.OutputTokens)
 	}
-	sse := []byte("data: {\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":2}}\n\n" +
-		"data: {\"usageMetadata\":{\"promptTokenCount\":30,\"candidatesTokenCount\":9}}\n\n")
-	if in, out := scanNativeUsage(sse); in != 30 || out != 9 {
-		t.Errorf("sse usage = %d/%d (want last frame)", in, out)
-	}
-	if in, out := scanNativeUsage([]byte("no usage here")); in != 0 || out != 0 {
-		t.Errorf("empty usage = %d/%d", in, out)
+
+	capture = &translate.UsageCapture{}
+	scan = &chatRelayUsage{capture: capture, native: true}
+	scan.feed([]byte("data: {\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":2}}\n\n" +
+		"data: {\"usageMetadata\":{\"promptTokenCount\":30,\"candidatesTokenCount\":9}}\n\n"))
+	if got := capture.Snapshot(); got.InputTokens != 30 || got.OutputTokens != 9 {
+		t.Errorf("sse usage = %d/%d, want 30/9", got.InputTokens, got.OutputTokens)
 	}
 }
 

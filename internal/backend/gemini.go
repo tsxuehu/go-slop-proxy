@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/edy/slop-proxy-go/internal/config"
 	"github.com/edy/slop-proxy-go/internal/translate"
@@ -20,10 +22,11 @@ var geminiRules = upstream.Classify{
 }
 
 type GeminiClient struct {
-	base    string
-	native  string
-	headers map[string]string
-	pool    *upstream.EgressPool
+	base        string
+	native      string
+	headers     map[string]string
+	pool        *upstream.EgressPool
+	retryBudget time.Duration
 }
 
 func NewGemini(cfg config.GeminiConfig) (*GeminiClient, error) {
@@ -36,8 +39,10 @@ func NewGemini(cfg config.GeminiConfig) (*GeminiClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &GeminiClient{base: base, native: native, headers: cfg.Headers, pool: pool}, nil
+	return &GeminiClient{base: base, native: native, headers: cfg.Headers, pool: pool, retryBudget: time.Duration(cfg.RetryBudgetSecs) * time.Second}, nil
 }
+
+func (c *GeminiClient) ReloadEgress() error { return c.pool.Reload() }
 
 func (c *GeminiClient) referer(accountReferer *string) *string {
 	if accountReferer != nil && *accountReferer != "" {
@@ -62,21 +67,22 @@ func (c *GeminiClient) withHeaders(h map[string]string, hasReferer bool) {
 
 type GeminiResponse struct {
 	Response *http.Response
-	Protocol string // "native" / "chat"
+	Protocol translate.BridgeProtocol
 }
 
 // Post sends a Chat request via either the native or OpenAI-compatible surface.
 func (c *GeminiClient) Post(ctx context.Context, key string, accountReferer *string, chat *translate.ChatRequest) (*GeminiResponse, *upstream.SendError) {
 	ref := c.referer(accountReferer)
-	translated, nativeBody := translateToNative(chat)
-	protocol := "chat"
-	if translated != nil {
-		protocol = "native"
-	}
+	protocol := translate.BridgeChat
 
 	var url, body string
 	headers := map[string]string{"Content-Type": "application/json"}
 	if ref != nil {
+		translated, nativeBody := translateToNative(chat)
+		if translated == nil {
+			return nil, &upstream.SendError{Kind: upstream.ErrBadRequest, Body: "request cannot be represented on Gemini's native endpoint"}
+		}
+		protocol = translate.BridgeGeminiNative
 		action := "generateContent"
 		if chat.Stream != nil && *chat.Stream {
 			action = "streamGenerateContent?alt=sse"
@@ -157,7 +163,7 @@ func (c *GeminiClient) PostNative(ctx context.Context, key string, referer *stri
 	if se != nil {
 		return nil, se
 	}
-	return &GeminiResponse{Response: checked, Protocol: "native"}, nil
+	return &GeminiResponse{Response: checked, Protocol: translate.BridgeGeminiNative}, nil
 }
 
 func (c *GeminiClient) Models(ctx context.Context, key string, accountReferer *string) ([]GeminiModel, *upstream.SendError) {
@@ -166,7 +172,15 @@ func (c *GeminiClient) Models(ctx context.Context, key string, accountReferer *s
 		headers["referer"] = *accountReferer
 	}
 	c.withHeaders(headers, accountReferer != nil)
-	resp, se := doGet(ctx, c.native+"/models?pageSize=1000", headers)
+	resp, se := c.pool.Send(ctx, func(_ *http.Client) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.native+"/models?pageSize=1000", nil)
+		if err == nil {
+			for name, value := range headers {
+				req.Header.Set(name, value)
+			}
+		}
+		return req, err
+	})
 	if se != nil {
 		return nil, se
 	}
@@ -212,10 +226,12 @@ type GeminiModel struct {
 }
 
 type nativeRequest struct {
-	Model             string          `json:"-"`
-	Contents          []nativeContent `json:"contents"`
-	SystemInstruction *nativeContent  `json:"systemInstruction,omitempty"`
-	GenerationConfig  json.RawMessage `json:"generationConfig,omitempty"`
+	Model             string           `json:"-"`
+	Contents          []nativeContent  `json:"contents"`
+	SystemInstruction *nativeContent   `json:"systemInstruction,omitempty"`
+	GenerationConfig  json.RawMessage  `json:"generationConfig,omitempty"`
+	Tools             []map[string]any `json:"tools,omitempty"`
+	ToolConfig        map[string]any   `json:"toolConfig,omitempty"`
 }
 
 type nativeContent struct {
@@ -250,10 +266,34 @@ func translateToNative(chat *translate.ChatRequest) (*nativeRequest, []byte) {
 			role = "model"
 		}
 		var parts []json.RawMessage
-		text := m.Text()
-		if text != "" {
-			p, _ := json.Marshal(map[string]any{"text": text})
-			parts = append(parts, p)
+		if m.Content != nil {
+			if m.Content.Parts == nil && m.Content.Text != "" {
+				part, _ := json.Marshal(map[string]string{"text": m.Content.Text})
+				parts = append(parts, part)
+			}
+			for _, part := range m.Content.Parts {
+				var nativePart map[string]any
+				switch {
+				case part.Type == "text":
+					nativePart = map[string]any{"text": part.Text}
+				case part.ImageURL != nil:
+					media, err := geminiMedia(part.ImageURL.Value)
+					if err != nil {
+						return nil, nil
+					}
+					nativePart = media
+				case part.InputAudio != nil:
+					format := "wav"
+					if part.InputAudio.Format != nil {
+						format = *part.InputAudio.Format
+					}
+					nativePart = map[string]any{"inlineData": map[string]string{"mimeType": "audio/" + format, "data": part.InputAudio.Data}}
+				default:
+					continue
+				}
+				encoded, _ := json.Marshal(nativePart)
+				parts = append(parts, encoded)
+			}
 		}
 		if m.ToolCalls != nil {
 			for j := range *m.ToolCalls {
@@ -339,11 +379,69 @@ func translateToNative(chat *translate.ChatRequest) (*nativeRequest, []byte) {
 			gc["thinkingConfig"] = map[string]any{"thinkingBudget": budget, "includeThoughts": true}
 		}
 	}
+	if chat.Stop != nil {
+		gc["stopSequences"] = chat.Stop.Values
+	}
+	if chat.ResponseFormat != nil {
+		switch chat.ResponseFormat.Kind {
+		case "json_object", "json_schema":
+			gc["responseMimeType"] = "application/json"
+			if chat.ResponseFormat.JSONSchema != nil {
+				gc["responseJsonSchema"] = chat.ResponseFormat.JSONSchema.Schema
+			}
+		}
+	}
 	gcBytes, _ := json.Marshal(gc)
 	nr.GenerationConfig = gcBytes
+
+	if chat.Tools != nil {
+		var declarations []map[string]any
+		for _, tool := range *chat.Tools {
+			def := tool.Def()
+			if def == nil || def.Name == "" {
+				continue
+			}
+			declaration := map[string]any{"name": def.Name}
+			if def.Description != nil {
+				declaration["description"] = *def.Description
+			}
+			if len(def.Parameters) > 0 {
+				declaration["parametersJsonSchema"] = def.Parameters
+			}
+			declarations = append(declarations, declaration)
+		}
+		if len(declarations) > 0 {
+			nr.Tools = []map[string]any{{"functionDeclarations": declarations}}
+		}
+	}
+	if choice := chat.ToolChoice; choice != nil {
+		mode := "AUTO"
+		selection := make(map[string]any)
+		switch {
+		case choice.Name != "":
+			mode = "ANY"
+			selection["allowedFunctionNames"] = []string{choice.Name}
+		case choice.Mode == "required":
+			mode = "ANY"
+		case choice.Mode == "none":
+			mode = "NONE"
+		}
+		selection["mode"] = mode
+		nr.ToolConfig = map[string]any{"functionCallingConfig": selection}
+	}
 
 	body, _ := json.Marshal(nr)
 	return nr, body
 }
 
-var _ = bytes.MinRead
+func geminiMedia(value string) (map[string]any, error) {
+	head, data, inline := strings.Cut(value, ",")
+	if strings.HasPrefix(head, "data:") {
+		mime, ok := strings.CutSuffix(strings.TrimPrefix(head, "data:"), ";base64")
+		if !inline || !ok || mime == "" || data == "" {
+			return nil, errors.New("invalid inline media")
+		}
+		return map[string]any{"inlineData": map[string]string{"mimeType": mime, "data": data}}, nil
+	}
+	return map[string]any{"fileData": map[string]string{"fileUri": value}}, nil
+}

@@ -58,7 +58,7 @@ func responsesTestServer(t *testing.T, upstream http.HandlerFunc) (*Server, stri
 }
 
 func responsesRequest(srv *Server, key string) *httptest.ResponseRecorder {
-	body := `{"model":"gpt-5","session_id":"sess-resp-1","reasoning":{"effort":"high"},` +
+	body := `{"model":"gpt-5","stream":true,"session_id":"sess-resp-1","reasoning":{"effort":"high"},` +
 		`"tools":[{"type":"function","name":"shell"}],` +
 		`"input":[{"role":"user","content":"hello"}]}`
 	req := httptest.NewRequest(http.MethodPost, "http://proxy.local/v1/responses", strings.NewReader(body))

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -27,12 +28,15 @@ import (
 	"github.com/edy/slop-proxy-go/internal/upstream"
 )
 
+type egressReloader interface{ ReloadEgress() error }
+
 type Server struct {
-	cfg     config.Config
-	store   *store.Store
-	pools   map[provider.Provider]*pool.Pool
-	backend *backend.CodexBackend
-	server  *http.Server
+	egressClients []egressReloader
+	cfg           config.Config
+	store         *store.Store
+	pools         map[provider.Provider]*pool.Pool
+	backend       *backend.CodexBackend
+	server        *http.Server
 
 	metricsMu     sync.Mutex
 	metricsServer *http.Server
@@ -43,12 +47,15 @@ type Server struct {
 	glmClient       *backend.GLMClient
 	copilotClient   *backend.CopilotClient
 	deepseekClient  *backend.DeepSeekClient
-	radianceClient  *backend.RadianceClient
+	radianceClient  *backend.MessagesRelay
 
-	catalogsMu sync.RWMutex
-	catalogs   map[provider.Provider][]string
-	prices     *pricing.Prices
-	metrics    *metricsState
+	catalogsMu       sync.RWMutex
+	catalogs         map[provider.Provider][]string
+	codexCatalogs    map[int64]cachedCodexCatalog
+	anthropicCatalog []backend.AnthropicModel
+	geminiCatalog    []backend.GeminiModel
+	prices           *pricing.Prices
+	metrics          *metricsState
 }
 
 func makePool(p provider.Provider, st *store.Store, refresher oauth.Refresher, b pool.Backend) *pool.Pool {
@@ -71,9 +78,10 @@ func NewServer(cfg config.Config, st *store.Store, refresher oauth.Refresher) *S
 	srv.pools[provider.OpenAI] = makePool(provider.OpenAI, st, refresher, codexBackend)
 
 	// Verbatim relay providers, adapted to the pool.Backend contract.
-	openRouter := backend.NewOpenRouter(cfg.OpenRouter)
-	experiential := backend.NewExperiential(cfg.Experiential)
-	radiance := backend.NewRadiance(cfg.Radiance)
+	openRouter := backend.NewMessagesRelay(cfg.OpenRouter, "openrouter")
+	experiential := backend.NewMessagesRelay(cfg.Experiential, "experiential")
+	radiance := backend.NewMessagesRelay(cfg.Radiance, "radiance")
+	srv.egressClients = append(srv.egressClients, openRouter, experiential, radiance)
 	srv.radianceClient = radiance
 	relays := []struct {
 		p    provider.Provider
@@ -94,6 +102,7 @@ func NewServer(cfg config.Config, st *store.Store, refresher oauth.Refresher) *S
 	}
 	if ds := backend.NewDeepSeek(cfg.DeepSeek); ds != nil {
 		srv.deepseekClient = ds
+		srv.egressClients = append(srv.egressClients, ds)
 		srv.pools[provider.DeepSeek] = makePool(provider.DeepSeek, st, refresher, backend.NewRelayBackend(provider.DeepSeek,
 			func(ctx context.Context, key string, r *backend.RelayRequest) (*http.Response, *upstream.SendError) {
 				return ds.Post(ctx, key, r.Path, r.Body)
@@ -101,6 +110,7 @@ func NewServer(cfg config.Config, st *store.Store, refresher oauth.Refresher) *S
 	}
 	if glm := backend.NewGLM(cfg.GLM); glm != nil {
 		srv.glmClient = glm
+		srv.egressClients = append(srv.egressClients, glm)
 		b := backend.NewRelayBackend(provider.GLM, func(ctx context.Context, key string, r *backend.RelayRequest) (*http.Response, *upstream.SendError) {
 			return glm.Post(ctx, key, r.Path, r.Body, r.SessionKey)
 		})
@@ -116,6 +126,7 @@ func NewServer(cfg config.Config, st *store.Store, refresher oauth.Refresher) *S
 	}
 	if zen, err := backend.NewZen(cfg.Zen); err == nil {
 		srv.zenClient = zen
+		srv.egressClients = append(srv.egressClients, zen)
 		b := backend.NewRelayBackend(provider.Zen, func(ctx context.Context, key string, r *backend.RelayRequest) (*http.Response, *upstream.SendError) {
 			var k *string
 			if key != "" {
@@ -129,10 +140,12 @@ func NewServer(cfg config.Config, st *store.Store, refresher oauth.Refresher) *S
 	}
 	if gem, err := backend.NewGemini(cfg.Gemini); err == nil {
 		srv.geminiClient = gem
+		srv.egressClients = append(srv.egressClients, gem)
 		srv.pools[provider.Gemini] = makePool(provider.Gemini, st, refresher, backend.NewGeminiBackend(gem, cfg.Gemini.SoftUtilizationLimit))
 	}
 	if anth, err := backend.NewAnthropic(cfg.Anthropic); err == nil {
 		srv.anthropicClient = anth
+		srv.egressClients = append(srv.egressClients, anth)
 		srv.pools[provider.Anthropic] = makePool(provider.Anthropic, st, refresher, backend.NewAnthropicBackend(anth, cfg.Anthropic.SoftUtilizationLimit))
 	}
 
@@ -146,13 +159,12 @@ func NewServer(cfg config.Config, st *store.Store, refresher oauth.Refresher) *S
 	return srv
 }
 
-// poolFor picks the backend pool for a model using the configured patterns.
-func (s *Server) poolFor(model string) *pool.Pool {
-	p := s.cfg.Models.Route(model)
-	if target, ok := s.pools[p]; ok {
-		return target
+func (s *Server) providerPool(w http.ResponseWriter, dialect dialect, target provider.Provider) *pool.Pool {
+	pl := s.pools[target]
+	if pl == nil {
+		writeAPIError(w, dialect, http.StatusServiceUnavailable, "api_error", "no usable "+target.String()+" backend")
 	}
-	return s.pools[provider.OpenAI]
+	return pl
 }
 
 func isVerbatimProvider(p provider.Provider) bool {
@@ -171,7 +183,8 @@ func isVerbatimProvider(p provider.Provider) bool {
 // clean success, truncated stream) folds a full UsageRecord-style row into
 // usage_log so the Prometheus error/tool/insight/session families see it.
 func (s *Server) relayMessages(w http.ResponseWriter, r *http.Request, body []byte, rc *requestContext, p provider.Provider, model string) {
-	upstream, effort := s.cfg.Models.Resolve(model)
+	resolved := translate.Resolve(&s.cfg, model)
+	upstream, effort := resolved.Model, resolved.Effort
 	scan := newRelayUsage()
 
 	// log is the single bookkeeping exit. Status, error_kind, attempts and
@@ -196,22 +209,32 @@ func (s *Server) relayMessages(w http.ResponseWriter, r *http.Request, body []by
 		return
 	}
 
-	pPool := s.poolFor(model)
+	pPool := s.providerPool(w, dialectAnthropic, p)
+	if pPool == nil {
+		log(http.StatusServiceUnavailable, "pool_no_accounts", nil, 1)
+		return
+	}
+	normalized := normalizedCountBody(body, model, upstream)
+	route := s.anthropicRoute(r, body, rc, upstream)
 	var req any
 	if p == provider.Anthropic {
 		req = &backend.AnthRequest{
-			Path: "/v1/messages", Body: body,
+			Path: "/v1/messages", Body: normalized,
 			Version:   r.Header.Get("anthropic-version"),
 			Beta:      r.Header.Get("anthropic-beta"),
 			UserAgent: r.Header.Get("user-agent"),
 		}
 	} else {
-		req = &backend.RelayRequest{Body: body, Path: "/v1/messages"}
+		path := "/v1/messages"
+		if p == provider.Zen {
+			path = "/messages"
+		}
+		req = &backend.RelayRequest{Body: normalized, Path: path}
 	}
-	served, err := pPool.Execute(r.Context(), s.route(r, body, rc, model), req)
+	served, err := pPool.Execute(r.Context(), route, req)
 	if err != nil {
 		log(poolErrorStatus(err), poolErrorKind(err), nil, poolErrorAttempts(err))
-		writePoolError(w, err)
+		writePoolErrorFor(w, dialectAnthropic, err)
 		return
 	}
 	resp, ok := served.Response.(*http.Response)
@@ -269,7 +292,16 @@ func (s *Server) backgroundReload(ctx context.Context) {
 				slog.Warn("pool reload failed", "error", err)
 			}
 		}
+		s.reloadEgress()
 		s.pollUsage(ctx)
+	}
+}
+
+func (s *Server) reloadEgress() {
+	for _, client := range s.egressClients {
+		if err := client.ReloadEgress(); err != nil {
+			slog.Warn("egress reload failed", "error", err)
+		}
 	}
 }
 
@@ -329,28 +361,18 @@ func (s *Server) refreshCatalogs(ctx context.Context) {
 			storeIDs(p, ids)
 		}
 	}
-	if pl := s.pools[provider.OpenAI]; pl != nil && s.backend != nil {
-		v, err := pl.FirstAnswer(ctx, func(ctx context.Context, token string, slot *pool.Slot) (any, error) {
-			snap, se := s.backend.Catalog(ctx, token, slot.ProviderAccountID)
-			if se != nil {
-				return nil, se
-			}
-			return snap, nil
-		})
-		if err != nil {
-			slog.Debug("catalog probe failed", "provider", provider.OpenAI, "error", err)
-		} else if snap, ok := v.(*backend.CatalogSnapshot); ok {
-			storeIDs(provider.OpenAI, snap.Models)
-			for _, slot := range pl.Slots().List() {
-				pl.Slots().SetServiceTiers(slot, snap.ServiceTiers)
-			}
-		}
-	}
 	if s.anthropicClient != nil {
-		ask(provider.Anthropic, func(ctx context.Context, token string, _ *pool.Slot) (any, error) {
-			ids, se := s.anthropicClient.Models(ctx, token)
+		ask(provider.Anthropic, func(ctx context.Context, token string, slot *pool.Slot) (any, error) {
+			models, se := s.anthropicClient.Models(ctx, token, slot.AuthMode)
 			if se != nil {
 				return nil, se
+			}
+			s.catalogsMu.Lock()
+			s.anthropicCatalog = models
+			s.catalogsMu.Unlock()
+			ids := make([]string, 0, len(models))
+			for _, model := range models {
+				ids = append(ids, model.ID)
 			}
 			return ids, nil
 		})
@@ -365,20 +387,28 @@ func (s *Server) refreshCatalogs(ctx context.Context) {
 			if se != nil {
 				return nil, se
 			}
+			s.catalogsMu.Lock()
+			s.geminiCatalog = models
+			s.catalogsMu.Unlock()
 			ids := make([]string, 0, len(models))
-			for _, m := range models {
-				ids = append(ids, m.ID)
+			for _, model := range models {
+				ids = append(ids, model.ID)
 			}
 			return ids, nil
 		})
 	}
 	if s.zenClient != nil {
-		ask(provider.Zen, func(ctx context.Context, _ string, _ *pool.Slot) (any, error) {
-			ids, se := s.zenClient.Models(ctx)
+		if ids, se := s.zenClient.Models(ctx); se == nil {
+			storeIDs(provider.Zen, ids)
+		}
+	}
+	if s.copilotClient != nil {
+		ask(provider.Copilot, func(ctx context.Context, token string, _ *pool.Slot) (any, error) {
+			models, se := s.copilotClient.Models(ctx, token)
 			if se != nil {
 				return nil, se
 			}
-			return ids, nil
+			return models, nil
 		})
 	}
 	if s.glmClient != nil {
@@ -422,10 +452,7 @@ func (s *Server) pollUsage(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			if snap, se := s.backend.Catalog(ctx, token, slot.ProviderAccountID); se == nil {
-				pl.Slots().SetCatalog(slot, snap.Models)
-				pl.Slots().SetServiceTiers(slot, snap.ServiceTiers)
-			}
+			s.codexAccountCatalog(ctx, pl, slot)
 			usage, se := s.backend.Usage(ctx, token, slot.ProviderAccountID)
 			if se != nil || usage == nil {
 				continue
@@ -559,9 +586,11 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("POST /oauth/token", s.oauthToken)
 	s.registerDesktopRoutes(mux)
 	s.registerProfileRoutes(mux)
-	mux.HandleFunc("POST /admin/token", s.createToken)
-	mux.HandleFunc("GET /admin/tokens", s.listTokens)
-	mux.HandleFunc("GET /admin/accounts", s.listAccounts)
+	if s.cfg.AdminToken != "" {
+		mux.HandleFunc("POST /admin/token", s.withAdminToken(s.createToken))
+		mux.HandleFunc("GET /admin/tokens", s.withAdminToken(s.listTokens))
+		mux.HandleFunc("GET /admin/accounts", s.withAdminToken(s.listAccounts))
+	}
 	mux.HandleFunc("GET /health", s.health)
 	// Cap all bodies and inflate zstd-encoded ones before routing, matching
 	// the Rust DefaultBodyLimit + decompress::zstd_requests middleware.
@@ -834,15 +863,11 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request, rc *req
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if s.cfg.Models.Blocked(chat.Model) {
-		writeError(w, http.StatusBadRequest, "model is blocked")
-		return
-	}
 	requested := chat.Model
-	upstream, effort := s.cfg.Models.Resolve(chat.Model)
-	target := s.cfg.Models.Route(chat.Model)
-	if !s.tokenMayUse(rc, target) {
-		writeAPIError(w, dialectOf(r.URL.Path), http.StatusForbidden, "permission_error", "this token is not allowed to use "+target.String())
+	resolved := translate.Resolve(&s.cfg, requested)
+	upstream, effort := resolved.Model, resolved.Effort
+	target := s.cfg.Models.Route(upstream)
+	if !s.admitModel(w, r, rc, upstream, target) {
 		return
 	}
 	switch target {
@@ -866,58 +891,45 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request, rc *req
 		}
 	}
 
-	chat.Model = upstream
 	irReq, err := translate.ToResponses(&chat, &s.cfg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	translated, err := json.Marshal(irReq)
+	route := s.translatedRoute(r, body, rc, &irReq)
+	capture := &translate.UsageCapture{}
+	reply, err := s.executeResponses(r.Context(), target, route, &irReq, nil, r.Header, capture)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if target == provider.Zen {
-		if gated := backend.SatisfyToolGate(translated); gated != nil {
-			translated = gated
-		}
-	}
-	stream := chat.Stream != nil && *chat.Stream
-
-	req := &backend.Request{Body: translated, Headers: r.Header.Clone(), Path: "/responses"}
-	served, err := s.poolFor(requested).Execute(r.Context(), s.route(r, body, rc, requested), req)
-	if err != nil {
+		s.logDispatchFailure(rc, target, requested, upstream, "chat", body, err)
 		writePoolError(w, err)
 		return
 	}
-	resp, ok := served.Response.(*backend.Response)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "unexpected upstream response")
-		return
-	}
-	defer resp.Body.Close()
+	defer reply.body.Close()
 
-	capture := &translate.UsageCapture{}
-	events := backend.ParseResponsesEvents(resp.Body, capture, capture.NoteBytes)
+	stream := chat.Stream != nil && *chat.Stream
+	status := http.StatusOK
+	var result []byte
 	if stream {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			writeError(w, http.StatusInternalServerError, "streaming unsupported")
 			return
 		}
-		in, out := backend.StreamChatResponses(events, requested, chat.IncludeUsage(), capture, w, flusher)
-		snap := capture.Snapshot()
-		s.recordUsage(rc, target, requested, upstream, "chat", served.AccountID, in, out,
-			UsageMeta{Body: body, Captured: &snap})
-		return
+		backend.StreamChatResponses(reply.events, requested, chat.IncludeUsage(), capture, w, flusher)
+	} else {
+		agg := backend.CollectResponses(reply.events, capture)
+		if agg.Error != nil {
+			status = http.StatusBadGateway
+			writeAPIError(w, dialectOpenAI, status, "api_error", *agg.Error)
+		} else {
+			result = translate.RenderAggregatedChat(&agg, requested)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(result)
+		}
 	}
-	result := backend.CollectChatResponses(events, requested, capture)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(result)
 	snap := capture.Snapshot()
-	s.recordUsage(rc, target, requested, upstream, "chat", served.AccountID, snap.InputTokens, snap.OutputTokens,
-		UsageMeta{Body: body, Captured: &snap, ResponseBytes: int64(len(result))})
+	s.recordUsage(rc, target, requested, upstream, "chat", reply.accountID, snap.InputTokens, snap.OutputTokens,
+		UsageMeta{Body: body, Captured: &snap, ResponseBytes: int64(len(result)), Attempts: reply.attempts, Status: status, Force: true})
 }
 
 // chatViaChatUpstream serves models whose upstream speaks the Chat wire
@@ -928,6 +940,10 @@ func (s *Server) chatViaChatUpstream(w http.ResponseWriter, r *http.Request, bod
 	if chat.ReasoningEffort == nil && effort != "" {
 		effortCopy := effort
 		chat.ReasoningEffort = &effortCopy
+	}
+	stream := chat.Stream != nil && *chat.Stream
+	if stream {
+		chat.StreamOptions = &translate.StreamOptions{IncludeUsage: true}
 	}
 	var req any
 	if p == provider.Gemini {
@@ -941,20 +957,17 @@ func (s *Server) chatViaChatUpstream(w http.ResponseWriter, r *http.Request, bod
 		agent, vision := copilotFlags(encoded)
 		req = &backend.RelayRequest{Body: encoded, Path: "/chat/completions", Agent: agent, Vision: vision}
 	}
-	served, err := s.pools[p].Execute(r.Context(), s.route(r, body, rc, requested), req)
+	pl := s.providerPool(w, dialectOpenAI, p)
+	if pl == nil {
+		return
+	}
+	served, err := pl.Execute(r.Context(), s.route(r, body, rc, upstream), req)
 	if err != nil {
+		s.logDispatchFailure(rc, p, requested, upstream, "chat", body, err)
 		writePoolError(w, err)
 		return
 	}
-	resp, ok := served.Response.(*http.Response)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "unexpected upstream response")
-		return
-	}
-	defer resp.Body.Close()
-	copyHeaders(w, resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	s.relayChat(w, rc, body, p, requested, upstream, effort, stream, served)
 }
 
 // zenChat serves models configured on Zen's Chat wire, padding the request
@@ -966,6 +979,10 @@ func (s *Server) zenChat(w http.ResponseWriter, r *http.Request, body []byte, rc
 		return
 	}
 	chat.Model = upstream
+	stream := chat.Stream != nil && *chat.Stream
+	if stream {
+		chat.StreamOptions = &translate.StreamOptions{IncludeUsage: true}
+	}
 	encoded, err := json.Marshal(chat)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -974,20 +991,13 @@ func (s *Server) zenChat(w http.ResponseWriter, r *http.Request, body []byte, rc
 	if gated := backend.SatisfyChatToolGate(encoded); gated != nil {
 		encoded = gated
 	}
-	served, err := pl.Execute(r.Context(), s.route(r, body, rc, requested), &backend.RelayRequest{Body: encoded, Path: "/chat/completions"})
+	served, err := pl.Execute(r.Context(), s.route(r, body, rc, upstream), &backend.RelayRequest{Body: encoded, Path: "/chat/completions"})
 	if err != nil {
+		s.logDispatchFailure(rc, provider.Zen, requested, upstream, "chat", body, err)
 		writePoolError(w, err)
 		return
 	}
-	resp, ok := served.Response.(*http.Response)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "unexpected upstream response")
-		return
-	}
-	defer resp.Body.Close()
-	copyHeaders(w, resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	s.relayChat(w, rc, body, provider.Zen, requested, upstream, "", stream, served)
 }
 
 func copilotFlags(body []byte) (agent, vision bool) {
@@ -1029,158 +1039,61 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rc *requestCon
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if s.cfg.Models.Blocked(anth.Model) {
-		writeError(w, http.StatusBadRequest, "model is blocked")
-		return
-	}
-
-	// Providers that speak the Messages wire verbatim bypass translation.
-	target := s.cfg.Models.Route(anth.Model)
-	if !s.tokenMayUse(rc, target) {
-		writeAPIError(w, dialectOf(r.URL.Path), http.StatusForbidden, "permission_error", "this token is not allowed to use "+target.String())
-		return
-	}
-	if isVerbatimProvider(target) || (target == provider.Zen && s.cfg.Models.ZenDialect(anth.Model) == config.ZenMessages) {
-		s.relayMessages(w, r, body, rc, target, anth.Model)
-		return
-	}
-
 	requested := anth.Model
-	upstream, model := s.cfg.Models.Resolve(anth.Model)
-	anth.Model = upstream
-	irReq, err := translate.AnthropicToResponses(&anth, &s.cfg, provider.OpenAI)
+	upstream := translate.Resolve(&s.cfg, requested).Model
+	target := s.cfg.Models.Route(upstream)
+	if !s.admitModel(w, r, rc, upstream, target) {
+		return
+	}
+	if isVerbatimProvider(target) || (target == provider.Zen && s.cfg.Models.ZenDialect(upstream) == config.ZenMessages) {
+		s.relayMessages(w, r, body, rc, target, requested)
+		return
+	}
+	if target == provider.Copilot {
+		writeAPIError(w, dialectAnthropic, http.StatusBadRequest, "invalid_request_error", "this model is served over /v1/chat/completions")
+		return
+	}
+
+	irReq, err := translate.AnthropicToResponses(&anth, &s.cfg, target)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	translated, err := json.Marshal(irReq)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	req := &backend.Request{Body: translated, Headers: r.Header.Clone(), Path: "/responses"}
-	served, err := s.poolFor(anth.Model).Execute(r.Context(), s.route(r, body, rc, anth.Model), req)
-	if err != nil {
-		writePoolError(w, err)
-		return
-	}
-	resp, ok := served.Response.(*backend.Response)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "unexpected upstream response")
-		return
-	}
-	defer resp.Body.Close()
-
+	route := s.translatedRoute(r, body, rc, &irReq)
 	capture := &translate.UsageCapture{}
-	events := backend.ParseResponsesEvents(resp.Body, capture, capture.NoteBytes)
+	reply, err := s.executeResponses(r.Context(), target, route, &irReq, nil, r.Header, capture)
+	if err != nil {
+		s.logDispatchFailure(rc, target, requested, upstream, "messages", body, err)
+		writePoolErrorFor(w, dialectAnthropic, err)
+		return
+	}
+	defer reply.body.Close()
+
 	emitThinking := anth.ThinkingEnabled()
 	stream := anth.Stream != nil && *anth.Stream
-
+	status := http.StatusOK
+	var result []byte
 	if stream {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			writeError(w, http.StatusInternalServerError, "streaming unsupported")
 			return
 		}
-		est := translate.Estimate(&irReq)
-		backend.StreamAnthropicResponses(events, model, est, emitThinking, capture, w, flusher)
+		backend.StreamAnthropicResponses(reply.events, upstream, translate.Estimate(&irReq), emitThinking, capture, w, flusher)
 	} else {
-		agg := translate.Aggregate(events, capture)
-		result := translate.RenderAggregatedAnthropic(&agg, model, emitThinking)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(result)
+		agg := backend.CollectResponses(reply.events, capture)
+		if agg.Error != nil {
+			status = http.StatusBadGateway
+			writeAPIError(w, dialectAnthropic, status, "api_error", *agg.Error)
+		} else {
+			result = translate.RenderAggregatedAnthropic(&agg, upstream, emitThinking)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(result)
+		}
 	}
 	snap := capture.Snapshot()
-	s.recordUsage(rc, target, requested, upstream, "anthropic", served.AccountID, snap.InputTokens, snap.OutputTokens,
-		UsageMeta{Body: body, Captured: &snap})
-}
-
-// responses relays a Responses body verbatim. Rust's responses_passthrough
-// folds a full UsageRecord out of the SSE stream (LogGuard + UsageCapture),
-// so this path logs every outcome too, not just the translated routes.
-func (s *Server) responses(w http.ResponseWriter, r *http.Request, rc *requestContext) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	var parsed struct {
-		Model string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &parsed)
-	target := s.cfg.Models.Route(parsed.Model)
-	if !s.tokenMayUse(rc, target) {
-		writeAPIError(w, dialectOf(r.URL.Path), http.StatusForbidden, "permission_error", "this token is not allowed to use "+target.String())
-		return
-	}
-	if target == provider.Zen {
-		if gated := backend.SatisfyToolGate(body); gated != nil {
-			body = gated
-		}
-	}
-	upstream, effort := s.cfg.Models.Resolve(parsed.Model)
-	scan := newResponsesUsage()
-	log := func(status int, errorKind string, accountID *int64, attempts int64) {
-		snap := scan.snapshot()
-		s.recordUsage(rc, target, parsed.Model, upstream, "responses", accountID,
-			snap.InputTokens, snap.OutputTokens,
-			UsageMeta{
-				Body: body, Captured: snap, Effort: effort,
-				Status: status, ErrorKind: errorKind, Attempts: attempts, Force: true,
-			})
-	}
-	req := &backend.Request{Body: body, Headers: r.Header.Clone(), Path: "/responses"}
-	served, err := s.poolFor(parsed.Model).Execute(r.Context(), s.route(r, body, rc, parsed.Model), req)
-	if err != nil {
-		log(poolErrorStatus(err), poolErrorKind(err), nil, poolErrorAttempts(err))
-		writePoolError(w, err)
-		return
-	}
-	resp, ok := served.Response.(*backend.Response)
-	if !ok {
-		log(http.StatusInternalServerError, "upstream_decode", served.AccountID, int64(served.Attempts))
-		writeError(w, http.StatusInternalServerError, "unexpected upstream response")
-		return
-	}
-	defer resp.Body.Close()
-	attempts := int64(served.Attempts)
-
-	copyHeaders(w, resp.Header)
-	streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
-	success := resp.StatusCode >= 200 && resp.StatusCode < 300
-	// Rust's responses_passthrough rewrites the per-account quota headers on a
-	// streamed Codex turn into pool-wide averages (x-codex-primary/secondary-*).
-	if streaming && target == provider.OpenAI {
-		if pl := s.poolFor(parsed.Model); pl != nil {
-			windows := pl.Slots().PoolWindows(rc.user, rc.token.PinnedAccount, s.cfg.Codex.SoftUtilizationLimit)
-			for name, vals := range responsesRateLimitHeaders(windows) {
-				if len(vals) > 0 {
-					w.Header().Set(name, vals[0])
-				}
-			}
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	if !success || !streaming {
-		buf, readErr := io.ReadAll(resp.Body)
-		if success {
-			scan.applyJSON(buf)
-		} else {
-			scan.noteBytes(len(buf))
-		}
-		_, _ = w.Write(buf)
-		kind := ""
-		if !success {
-			kind = "upstream_error"
-		} else if readErr != nil {
-			kind = "upstream_read"
-		}
-		log(resp.StatusCode, kind, served.AccountID, attempts)
-		return
-	}
-	streamObserved(w, resp.Body, scan, resp.StatusCode)
-	log(resp.StatusCode, "", served.AccountID, attempts)
+	s.recordUsage(rc, target, requested, upstream, "messages", reply.accountID, snap.InputTokens, snap.OutputTokens,
+		UsageMeta{Body: body, Captured: &snap, ResponseBytes: int64(len(result)), Attempts: reply.attempts, Status: status, Force: true})
 }
 
 // alphaSearch relays Codex's web-search tool call. It always goes to the Codex
@@ -1240,18 +1153,6 @@ func (s *Server) websocketFallback(w http.ResponseWriter, r *http.Request, rc *r
 
 // geminiModels answers the /v1beta discovery surface in the same shape as
 // /v1/models, narrowed to models routed to Gemini.
-func (s *Server) geminiModels(w http.ResponseWriter, r *http.Request, rc *requestContext) {
-	now := time.Now().Unix()
-	data := make([]any, 0)
-	for _, id := range s.catalog(provider.Gemini) {
-		if id == "" || !s.tokenMayUse(rc, provider.Gemini) {
-			continue
-		}
-		data = append(data, map[string]any{"id": id, "object": "model", "created": now, "owned_by": "google"})
-	}
-	writeJSON(w, map[string]any{"object": "list", "data": data})
-}
-
 // countTokens relays to Anthropic's own endpoint when the model routes there,
 // and falls back to the local estimator for every other provider. This is a
 // routing branch, not a failure fallback: a failed relay returns the upstream
@@ -1265,19 +1166,13 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request, rc *request
 	var peek struct {
 		Model string `json:"model"`
 	}
-	_ = json.Unmarshal(body, &peek)
-	target := s.cfg.Models.Route(peek.Model)
-	if s.cfg.Models.Blocked(peek.Model) {
-		writeAPIError(w, dialectAnthropic, http.StatusForbidden, "permission_error",
-			peek.Model+" is blocked on this proxy")
+	if json.Unmarshal(body, &peek) != nil {
+		writeAPIError(w, dialectAnthropic, http.StatusBadRequest, "invalid_request_error", "invalid request")
 		return
 	}
-	if !s.tokenMayUse(rc, target) {
-		writeAPIError(w, dialectAnthropic, http.StatusForbidden, "permission_error", "this token is not allowed to use "+target.String())
-		return
-	}
-	if rc.tokensSpent != nil {
-		writeAPIError(w, dialectAnthropic, http.StatusTooManyRequests, "rate_limit_error", "API token token limit exceeded for the anthropic backend")
+	resolved := translate.Resolve(&s.cfg, peek.Model).Model
+	target := s.cfg.Models.Route(resolved)
+	if !s.admitModel(w, r, rc, resolved, target) {
 		return
 	}
 
@@ -1314,7 +1209,7 @@ func (s *Server) relayCountTokens(w http.ResponseWriter, r *http.Request, rc *re
 	}
 	resolved := translate.Resolve(&s.cfg, requested)
 	normalized := normalizedCountBody(body, requested, resolved.Model)
-	route := s.route(r, body, rc, resolved.Model)
+	route := s.anthropicRoute(r, body, rc, resolved.Model)
 	served, err := pl.Execute(r.Context(), route, &backend.AnthRequest{
 		Path: "/v1/messages/count_tokens", Body: normalized,
 		Version: r.Header.Get("anthropic-version"), Beta: r.Header.Get("anthropic-beta"),
@@ -1410,13 +1305,13 @@ func (s *Server) geminiNative(w http.ResponseWriter, r *http.Request, rc *reques
 		writeAPIError(w, dialectOpenAI, http.StatusNotFound, "invalid_request_error", "unsupported action on the native surface")
 		return
 	}
-	target := s.cfg.Models.Route(rawModel)
+	resolved := translate.Resolve(&s.cfg, rawModel).Model
+	target := s.cfg.Models.Route(resolved)
 	if target != provider.Gemini {
 		writeAPIError(w, dialectOpenAI, http.StatusBadRequest, "invalid_request_error", "this model is not served by the gemini backend")
 		return
 	}
-	if !s.tokenMayUse(rc, target) {
-		writeAPIError(w, dialectOpenAI, http.StatusForbidden, "permission_error", "this token is not allowed to use "+target.String())
+	if !s.admitModel(w, r, rc, resolved, target) {
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -1428,67 +1323,31 @@ func (s *Server) geminiNative(w http.ResponseWriter, r *http.Request, rc *reques
 		writeAPIError(w, dialectOpenAI, http.StatusBadRequest, "invalid_request_error", "invalid request")
 		return
 	}
-	resolved, _ := s.cfg.Models.Resolve(rawModel)
 	pl := s.pools[provider.Gemini]
 	if pl == nil {
 		writeError(w, http.StatusServiceUnavailable, "no gemini accounts; run login")
 		return
 	}
-	req := &backend.GeminiNativeRequest{Model: resolved, Action: action, Query: r.URL.RawQuery, Body: body}
+	query := r.URL.Query()
+	query.Del("key")
+	query.Del("api_key")
+	if action == "streamGenerateContent" {
+		query.Set("alt", "sse")
+	}
+	req := &backend.GeminiNativeRequest{Model: resolved, Action: action, Query: query.Encode(), Body: body}
 	served, err := pl.Execute(r.Context(), s.route(r, body, rc, resolved), req)
 	if err != nil {
 		writePoolError(w, err)
 		return
 	}
-	resp, ok := served.Response.(*http.Response)
+	result, ok := served.Response.(*backend.GeminiResponse)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "unexpected upstream response")
+		writeError(w, http.StatusBadGateway, "unexpected upstream response")
 		return
 	}
+	resp := result.Response
 	defer resp.Body.Close()
-	buf, err := io.ReadAll(resp.Body)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "reading upstream response: "+err.Error())
-		return
-	}
-	in, out := scanNativeUsage(buf)
-	if in+out > 0 {
-		s.recordUsage(rc, provider.Gemini, rawModel, resolved, "native", served.AccountID, in, out,
-			UsageMeta{Body: body, ResponseBytes: int64(len(buf))})
-	}
-	copyHeaders(w, resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(buf)
-}
-
-// scanNativeUsage extracts prompt/candidate token counts from a Gemini native
-// response. For streamed SSE replies the last frame carrying usageMetadata
-// wins; for JSON replies the top-level object is used.
-func scanNativeUsage(body []byte) (int64, int64) {
-	type usage struct {
-		UsageMetadata struct {
-			PromptTokenCount     int64 `json:"promptTokenCount"`
-			CandidatesTokenCount int64 `json:"candidatesTokenCount"`
-		} `json:"usageMetadata"`
-	}
-	var doc usage
-	if json.Unmarshal(body, &doc) == nil && doc.UsageMetadata.PromptTokenCount+doc.UsageMetadata.CandidatesTokenCount > 0 {
-		return doc.UsageMetadata.PromptTokenCount, doc.UsageMetadata.CandidatesTokenCount
-	}
-	var in, out int64
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		var frame usage
-		if json.Unmarshal([]byte(payload), &frame) == nil && frame.UsageMetadata.PromptTokenCount+frame.UsageMetadata.CandidatesTokenCount > 0 {
-			in = frame.UsageMetadata.PromptTokenCount
-			out = frame.UsageMetadata.CandidatesTokenCount
-		}
-	}
-	return in, out
+	s.relayChatBody(w, rc, body, provider.Gemini, rawModel, resolved, "native", "", served, resp, true)
 }
 
 // Desktop reads and writes for ChatGPT features the proxy has no part in.
@@ -2021,36 +1880,22 @@ func (s *Server) oauthToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, mintCodexTokens(&requestContext{token: tok, user: tok.User}, key))
 }
 
-var modelOwners = map[provider.Provider]string{
-	provider.OpenAI: "openai", provider.Anthropic: "anthropic",
-	provider.Gemini: "google", provider.Zen: "opencode", provider.GLM: "zai",
-	provider.DeepSeek: "deepseek", provider.Copilot: "github",
-	provider.OpenRouter: "openrouter", provider.Radiance: "radiance",
-	provider.Experiential: "experiential",
-}
-
-func (s *Server) models(w http.ResponseWriter, r *http.Request, rc *requestContext) {
-	now := time.Now().Unix()
-	seen := map[string]bool{}
-	var data []any
-	// Always advertise the codex models even before the first catalog probe.
-	for _, id := range []string{"gpt-5", "gpt-5-codex"} {
-		seen[id] = true
-		data = append(data, map[string]any{"id": id, "object": "model", "created": now, "owned_by": "openai"})
+func (s *Server) admitModel(w http.ResponseWriter, r *http.Request, rc *requestContext, model string, target provider.Provider) bool {
+	d := dialectOf(r.URL.Path)
+	if s.cfg.Models.Blocked(model) {
+		writeAPIError(w, d, http.StatusForbidden, "permission_error", model+" is blocked on this proxy")
+		return false
 	}
-	for p, owner := range modelOwners {
-		for _, id := range s.catalog(p) {
-			if id == "" || seen[id] || !s.tokenMayUse(rc, p) {
-				continue
-			}
-			seen[id] = true
-			data = append(data, map[string]any{"id": id, "object": "model", "created": now, "owned_by": owner})
-		}
+	if !rc.token.MayUse(target) {
+		writeAPIError(w, d, http.StatusForbidden, "permission_error", "this token is not scoped to the "+target.String()+" backend")
+		return false
 	}
-	sort.Slice(data, func(i, j int) bool {
-		return data[i].(map[string]any)["id"].(string) < data[j].(map[string]any)["id"].(string)
-	})
-	writeJSON(w, map[string]any{"object": "list", "data": data})
+	if rc.tokensSpent != nil && rc.token.Meters(target) {
+		w.Header().Set("Retry-After", strconv.FormatInt(*rc.tokensSpent, 10))
+		writeAPIError(w, d, http.StatusTooManyRequests, "rate_limit_error", "API token token limit exceeded for the "+target.String()+" backend")
+		return false
+	}
+	return true
 }
 
 func (s *Server) tokenMayUse(rc *requestContext, p provider.Provider) bool {
@@ -2183,6 +2028,19 @@ func (s *Server) recordUsage(rc *requestContext, p provider.Provider, requested,
 		DurationMS: duration, CostUSD: cost, ListCostUSD: listCost,
 	}); err != nil {
 		slog.Warn("log usage failed", "error", err)
+	}
+}
+
+func (s *Server) withAdminToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") ||
+			subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeAPIError(w, dialectOpenAI, http.StatusUnauthorized, "authentication_error", "valid admin token required")
+			return
+		}
+		next(w, r)
 	}
 }
 

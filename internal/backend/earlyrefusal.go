@@ -39,16 +39,26 @@ const (
 // fail over instead of handing the error to the caller. The buffered head is
 // replayed verbatim whenever the stream is safe to serve.
 func refuseEarly(resp *http.Response) (*Response, error) {
-	head := readVerdictHead(resp.Body)
+	head, pending := readVerdictHead(resp.Body, verdictDeadline)
 	replay := func() *Response {
+		var readers []io.Reader
+		readers = append(readers, bytes.NewReader(head))
+		if pending != nil {
+			readers = append(readers, &pendingBodyRead{result: pending})
+		}
+		readers = append(readers, resp.Body)
 		return &Response{
 			StatusCode: resp.StatusCode,
 			Header:     resp.Header,
-			Body:       io.NopCloser(io.MultiReader(bytes.NewReader(head), resp.Body)),
+			Body: struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(readers...), resp.Body},
 		}
 	}
 	switch openingVerdict(head) {
 	case verdictRefused:
+		_ = resp.Body.Close()
 		secs := int64(earlyRefusalCooldown)
 		for _, code := range exhaustedCodes {
 			if strings.Contains(string(head), code) {
@@ -58,6 +68,7 @@ func refuseEarly(resp *http.Response) (*Response, error) {
 		}
 		return nil, &pool.SendError{Kind: pool.SendRateLimited, RetryAfter: &secs, Body: string(head)}
 	case verdictUndecryptable:
+		_ = resp.Body.Close()
 		// The Rust original retries after dropping encrypted payloads. We do
 		// not carry that retry here, so surface it as a bad request instead of
 		// cooling an otherwise healthy account.
@@ -71,50 +82,64 @@ func refuseEarly(resp *http.Response) (*Response, error) {
 // 256 KiB head budget is exhausted, or the 35s verdict deadline elapses. A
 // single reader goroutine is driven one chunk at a time so it never consumes
 // bytes beyond the prefix we are going to replay.
-func readVerdictHead(body io.Reader) []byte {
-	type readResult struct {
-		b   []byte
-		err error
+type bodyRead struct {
+	data []byte
+	err  error
+}
+
+// pendingBodyRead owns the read already in progress when the verdict times
+// out. Replay must finish this read before starting another on the same body.
+type pendingBodyRead struct {
+	result <-chan bodyRead
+	buffer *bytes.Reader
+	err    error
+}
+
+func (r *pendingBodyRead) Read(p []byte) (int, error) {
+	if r.result != nil {
+		result := <-r.result
+		r.result = nil
+		r.buffer, r.err = bytes.NewReader(result.data), result.err
 	}
-	reqCh := make(chan struct{}, 1)
-	resCh := make(chan readResult, 1)
+	if r.buffer.Len() > 0 {
+		return r.buffer.Read(p)
+	}
+	if r.err != nil {
+		err := r.err
+		r.err = nil
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func readVerdictHead(body io.Reader, deadline time.Duration) ([]byte, <-chan bodyRead) {
+	request := make(chan struct{}, 1)
+	results := make(chan bodyRead, 1)
 	go func() {
-		buf := make([]byte, 8192)
-		for range reqCh {
-			n, err := body.Read(buf)
-			var b []byte
-			if n > 0 {
-				b = append([]byte(nil), buf[:n]...)
-			}
-			resCh <- readResult{b: b, err: err}
+		buffer := make([]byte, 8192)
+		for range request {
+			n, err := body.Read(buffer)
+			results <- bodyRead{data: bytes.Clone(buffer[:n]), err: err}
 			if err != nil {
 				return
 			}
 		}
 	}()
-	defer close(reqCh)
+	defer close(request)
 
-	timer := time.NewTimer(verdictDeadline)
+	timer := time.NewTimer(deadline)
 	defer timer.Stop()
 	var head []byte
 	for {
-		reqCh <- struct{}{}
+		request <- struct{}{}
 		select {
-		case r := <-resCh:
-			if len(r.b) > 0 {
-				head = append(head, r.b...)
-				if openingVerdict(head) != verdictPending {
-					return head
-				}
-				if len(head) > verdictHeadLimit {
-					return head
-				}
-			}
-			if r.err != nil {
-				return head
+		case result := <-results:
+			head = append(head, result.data...)
+			if result.err != nil || len(head) >= verdictHeadLimit || openingVerdict(head) != verdictPending {
+				return head, nil
 			}
 		case <-timer.C:
-			return head
+			return head, results
 		}
 	}
 }

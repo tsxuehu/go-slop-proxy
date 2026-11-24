@@ -82,13 +82,7 @@ func (s *Server) prepareWSRequest(raw []byte) (*wsPrepared, error) {
 	delete(frame, "stream")
 	delete(frame, "background")
 
-	encoded := mustMarshal(frame)
-	encoded = bytes.ReplaceAll(encoded,
-		[]byte(`"namespace":"`+reservedNamespace+`"`),
-		[]byte(`"namespace":"`+proxyNamespace+`"`))
-	encoded = bytes.ReplaceAll(encoded,
-		[]byte("functions."+reservedNamespace+"."),
-		[]byte("functions."+proxyNamespace+"."))
+	encoded := renameReservedNamespace(mustMarshal(frame))
 
 	streamID, _ := jsonString(frame["stream_id"])
 	generate := true
@@ -105,6 +99,15 @@ func (s *Server) prepareWSRequest(raw []byte) (*wsPrepared, error) {
 		ServiceTier: serviceTier, Effort: effort, Generate: generate, StreamID: streamID,
 		HasPrevious: hasPrevious, RequestBytes: int64(len(raw)),
 	}, nil
+}
+
+func renameReservedNamespace(encoded []byte) []byte {
+	encoded = bytes.ReplaceAll(encoded,
+		[]byte(`"namespace":"`+reservedNamespace+`"`),
+		[]byte(`"namespace":"`+proxyNamespace+`"`))
+	return bytes.ReplaceAll(encoded,
+		[]byte("functions."+reservedNamespace+"."),
+		[]byte("functions."+proxyNamespace+"."))
 }
 
 // restoreReservedNamespace puts the collaboration namespace back on upstream
